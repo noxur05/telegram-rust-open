@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches-ignore:
+      - main
+      - gh-pages
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: build + test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build
+
+      - name: cargo check
+        run: cargo check --all-targets --locked
+
+      # Smoke tests in auth/http_client.rs and auth/nowpayments.rs construct a
+      # client from get_config(), which .expect()s these env vars. Real values
+      # are not needed — nothing connects during tests.
+      - name: cargo test
+        env:
+          TELEGRAM_BOT_API: "0:dummy_ci_token"
+          DATABASE_URL: "postgres://ci:ci@localhost/ci"
+          MARZBAN_HOST: "https://example.com"
+          MARZBAN_USERNAME: "ci"
+          MARZBAN_PASSWORD: "ci"
+          NOWPAYMENTS_API_KEY: "ci"
+        run: cargo test --all-targets --locked
+
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+      - name: binary sanity
+        run: |
+          file target/release/telegram-happ-rust
+          ls -la target/release/telegram-happ-rust
+          du -h target/release/telegram-happ-rust
+
+      - name: clippy (non-fatal)
+        run: cargo clippy --all-targets --locked -- -A clippy::all || true

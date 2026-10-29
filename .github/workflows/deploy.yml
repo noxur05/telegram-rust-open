@@ -1,0 +1,220 @@
+name: Deploy to production
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type DEPLOY to confirm (manual deploy only)'
+        required: false
+        default: ''
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: build + deploy
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    environment: production
+
+    # Job-level, NOT workflow-level: the `secrets` context is not available to
+    # workflow-level `env`, so PROD_USER would silently resolve to empty and
+    # every ssh would run as "@host". Reuses the secrets already on this repo
+    # (SSH_USER / SSH_HOST / SSH_PRIVATE_KEY); PROD_HOST_KEY is optional.
+    env:
+      PROD_USER: ${{ secrets.SSH_USER }}
+      PROD_DIR: /root/rust
+
+    steps:
+      - name: guard — manual deploy must type DEPLOY
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "${{ inputs.confirm }}" != "DEPLOY" ]; then
+            echo "::error::Refusing manual deploy: confirm input must be literal 'DEPLOY'."
+            exit 1
+          fi
+
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build
+
+      - name: cargo check
+        run: cargo check --all-targets --locked
+
+      - name: cargo test
+        env:
+          TELEGRAM_BOT_API: "0:dummy_ci_token"
+          DATABASE_URL: "postgres://ci:ci@localhost/ci"
+          MARZBAN_HOST: "https://example.com"
+          MARZBAN_USERNAME: "ci"
+          MARZBAN_PASSWORD: "ci"
+          NOWPAYMENTS_API_KEY: "ci"
+        run: cargo test --all-targets --locked
+
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+      - name: binary sanity
+        run: |
+          file target/release/telegram-happ-rust
+          test -x target/release/telegram-happ-rust
+
+      - name: configure SSH
+        env:
+          SSH_KEY:      ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_HOST_KEY: ${{ secrets.PROD_HOST_KEY }}
+          PROD_HOST:    ${{ secrets.SSH_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          # Pin the host key when PROD_HOST_KEY is set; otherwise fall back to
+          # ssh-keyscan, which is trust-on-first-use on every run and therefore
+          # MITM-able. Pin it with:
+          #   ssh-keyscan example-a.com | gh secret set PROD_HOST_KEY
+          if [ -n "$SSH_HOST_KEY" ]; then
+            printf '%s\n' "$SSH_HOST_KEY" > ~/.ssh/known_hosts
+            echo "host key: pinned from PROD_HOST_KEY"
+          else
+            ssh-keyscan -H "$PROD_HOST" > ~/.ssh/known_hosts 2>/dev/null
+            echo "::warning::PROD_HOST_KEY not set — using ssh-keyscan (trust-on-first-use). Set the secret to pin the host key."
+          fi
+          chmod 644 ~/.ssh/known_hosts
+          test -s ~/.ssh/known_hosts || { echo "::error::known_hosts is empty"; exit 1; }
+
+      - name: preflight — reach prod
+        env:
+          PROD_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o ConnectTimeout=15 -o BatchMode=yes \
+              -o UserKnownHostsFile=~/.ssh/known_hosts \
+              "${PROD_USER}@${PROD_HOST}" 'echo ok; systemctl is-active telegram-bot.service || true'
+
+      - name: backup current binary
+        env:
+          PROD_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          # Snapshot the running binary so the rollback step can restore it.
+          # Migrations are applied manually per DEPLOY.md and are not part of
+          # the deploy artifact, so we don't snapshot them.
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes \
+              -o UserKnownHostsFile=~/.ssh/known_hosts \
+              "${PROD_USER}@${PROD_HOST}" '
+              set -e
+              cp "'"${PROD_DIR}"'/telegram-happ-rust" "'"${PROD_DIR}"'/telegram-happ-rust.previous"
+              ls -la "'"${PROD_DIR}"'/telegram-happ-rust"* | head -5
+              '
+
+      - name: stop service
+        id: stop
+        env:
+          PROD_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes \
+              -o UserKnownHostsFile=~/.ssh/known_hosts \
+              "${PROD_USER}@${PROD_HOST}" "systemctl stop telegram-bot.service && systemctl is-active telegram-bot.service; exit 0"
+
+      - name: upload binary
+        env:
+          PROD_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          scp -i ~/.ssh/deploy_key -o BatchMode=yes \
+              -o UserKnownHostsFile=~/.ssh/known_hosts \
+              target/release/telegram-happ-rust \
+              "${PROD_USER}@${PROD_HOST}:${PROD_DIR}/telegram-happ-rust.new"
+
+          # chmod then atomic rename so a partial scp can't leave a corrupt binary
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes \
+              -o UserKnownHostsFile=~/.ssh/known_hosts \
+              "${PROD_USER}@${PROD_HOST}" \
+              "chmod 755 '${PROD_DIR}/telegram-happ-rust.new' && mv '${PROD_DIR}/telegram-happ-rust.new' '${PROD_DIR}/telegram-happ-rust' && ls -la '${PROD_DIR}/telegram-happ-rust'"
+
+      - name: start service + health check
+        id: health
+        env:
+          PROD_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          set -e
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes \
+              -o UserKnownHostsFile=~/.ssh/known_hosts \
+              "${PROD_USER}@${PROD_HOST}" "systemctl start telegram-bot.service"
+
+          # Boot + DB connect + Marzban token fetch can take a few seconds
+          sleep 8
+
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes \
+              -o UserKnownHostsFile=~/.ssh/known_hosts \
+              "${PROD_USER}@${PROD_HOST}" '
+              set -e
+              STATE=$(systemctl is-active telegram-bot.service || true)
+              echo "systemctl is-active: $STATE"
+              if [ "$STATE" != "active" ]; then
+                echo "::error::service not active"
+                journalctl -u telegram-bot.service -n 80 --no-pager || true
+                exit 1
+              fi
+              LOG=$(journalctl -u telegram-bot.service --since "30 seconds ago" --no-pager)
+              echo "$LOG" | tail -40
+              if echo "$LOG" | grep -Ei "panic|thread .* panicked|FATAL|SIGSEGV" ; then
+                echo "::error::panic or fatal error in startup log"
+                exit 1
+              fi
+              if ! echo "$LOG" | grep -q "Bot is running"; then
+                echo "::warning::did not see \"Bot is running\" marker yet"
+              fi
+              echo "health check: ok"
+              '
+
+      # Trigger on ANY failure once the service has been stopped — not just a
+      # failed health check. A failed scp or a failed `systemctl start` would
+      # otherwise leave the bot down with no recovery step.
+      - name: rollback on failure
+        if: failure() && steps.stop.outcome == 'success'
+        env:
+          PROD_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          echo "::warning::rolling back to previous binary"
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes \
+              -o UserKnownHostsFile=~/.ssh/known_hosts \
+              "${PROD_USER}@${PROD_HOST}" '
+              set -e
+              systemctl stop telegram-bot.service || true
+              if [ ! -x "'"${PROD_DIR}"'/telegram-happ-rust.previous" ]; then
+                echo "::error::no previous binary found — manual intervention needed"
+                exit 1
+              fi
+              cp "'"${PROD_DIR}"'/telegram-happ-rust.previous" "'"${PROD_DIR}"'/telegram-happ-rust"
+              systemctl start telegram-bot.service
+              # Poll up to 30s — startup connects to DB and fetches Marzban token
+              ok=0
+              for i in 1 2 3 4 5 6; do
+                sleep 5
+                STATE=$(systemctl is-active telegram-bot.service || true)
+                echo "rollback poll #$i: $STATE"
+                if [ "$STATE" = "active" ]; then ok=1; break; fi
+              done
+              if [ "$ok" = "1" ]; then
+                echo "rollback complete"
+              else
+                journalctl -u telegram-bot.service -n 60 --no-pager || true
+                echo "::error::rollback failed — service did not return to active"
+                exit 1
+              fi
+              '
+
+      - name: cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
